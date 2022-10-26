@@ -4,7 +4,6 @@ import 'dart:io';
 import 'package:uuid/uuid.dart';
 import 'package:wallet_connect/models/ethereum/wc_ethereum_sign_message.dart';
 import 'package:wallet_connect/models/ethereum/wc_ethereum_transaction.dart';
-import 'package:wallet_connect/models/ethereum/wc_wallet_switch_network.dart';
 import 'package:wallet_connect/models/exception/exceptions.dart';
 import 'package:wallet_connect/models/jsonrpc/json_rpc_error.dart';
 import 'package:wallet_connect/models/jsonrpc/json_rpc_error_response.dart';
@@ -21,22 +20,19 @@ import 'package:wallet_connect/models/wc_peer_meta.dart';
 import 'package:wallet_connect/models/wc_socket_message.dart';
 import 'package:wallet_connect/wc_cipher.dart';
 import 'package:wallet_connect/wc_session_store.dart';
-import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 typedef SessionRequest = void Function(int id, WCPeerMeta peerMeta);
 typedef SocketError = void Function(dynamic message);
-typedef SocketClose = void Function(int? code, String? reason);
+typedef SocketClose = void Function(int? code, String? reason, WCSession? sessionData);
 typedef EthSign = void Function(int id, WCEthereumSignMessage message);
 typedef EthTransaction = void Function(
     int id, WCEthereumTransaction transaction);
 typedef CustomRequest = void Function(int id, String payload);
-typedef WalletSwitchNetwork = void Function(int id, int chainId);
 
 class WCClient {
   late WebSocketChannel _webSocket;
   Stream _socketStream = Stream.empty();
-
   // ignore: close_sinks
   WebSocketSink? _socketSink;
   WCSession? _session;
@@ -45,7 +41,7 @@ class WCClient {
   int _handshakeId = -1;
   int? _chainId;
   String? _peerId;
-  String? _remotePeerId;
+  late String? _remotePeerId;
   bool _isConnected = false;
 
   WCClient({
@@ -55,7 +51,6 @@ class WCClient {
     this.onEthSign,
     this.onEthSignTransaction,
     this.onEthSendTransaction,
-    this.onWalletSwitchNetwork,
     this.onCustomRequest,
     this.onConnect,
   });
@@ -66,40 +61,28 @@ class WCClient {
   final EthSign? onEthSign;
   final EthTransaction? onEthSignTransaction, onEthSendTransaction;
   final CustomRequest? onCustomRequest;
-  final WalletSwitchNetwork? onWalletSwitchNetwork;
   final Function()? onConnect;
 
   WCSession? get session => _session;
-
   WCPeerMeta? get peerMeta => _peerMeta;
-
   WCPeerMeta? get remotePeerMeta => _remotePeerMeta;
-
   int? get chainId => _chainId;
-
   String? get peerId => _peerId;
-
   String? get remotePeerId => _remotePeerId;
-
   bool get isConnected => _isConnected;
 
-  Future<void> connectNewSession({
+  connectNewSession({
     required WCSession session,
     required WCPeerMeta peerMeta,
-    HttpClient? customHttpClient,
-  }) async {
-    await _connect(
+  }) {
+    _connect(
       session: session,
       peerMeta: peerMeta,
-      customClient: customHttpClient,
     );
   }
 
-  Future<void> connectFromSessionStore(
-    WCSessionStore sessionStore, {
-    HttpClient? customHttpClient,
-  }) async {
-    await _connect(
+  connectFromSessionStore(WCSessionStore sessionStore) {
+    _connect(
       fromSessionStore: true,
       session: sessionStore.session,
       peerMeta: sessionStore.peerMeta,
@@ -107,7 +90,6 @@ class WCClient {
       peerId: sessionStore.peerId,
       remotePeerId: sessionStore.remotePeerId,
       chainId: sessionStore.chainId,
-      customClient: customHttpClient,
     );
   }
 
@@ -136,7 +118,7 @@ class WCClient {
       id: _handshakeId,
       result: result.toJson(),
     );
-    // print('approveSession ${jsonEncode(response.toJson())}');
+    print('approveSession ${jsonEncode(response.toJson())}');
     onConnect?.call();
     _encryptAndSend(jsonEncode(response.toJson()));
   }
@@ -146,10 +128,9 @@ class WCClient {
     int? chainId,
     bool approved = true,
   }) async {
-    _chainId = chainId ?? _chainId;
     final param = WCSessionUpdate(
       approved: approved,
-      chainId: _chainId,
+      chainId: _chainId ?? chainId,
       accounts: accounts,
     );
     final request = JsonRpcRequest(
@@ -202,8 +183,7 @@ class WCClient {
     String? peerId,
     String? remotePeerId,
     int? chainId,
-    HttpClient? customClient,
-  }) async {
+  }) {
     if (session == WCSession.empty()) {
       throw InvalidSessionException();
     }
@@ -217,11 +197,7 @@ class WCClient {
     _chainId = chainId;
     final bridgeUri =
         Uri.parse(session.bridge.replaceAll('https://', 'wss://'));
-    final ws = await WebSocket.connect(
-      bridgeUri.toString(),
-      customClient: customClient,
-    );
-    _webSocket = new IOWebSocketChannel(ws);
+    _webSocket = WebSocketChannel.connect(bridgeUri);
     _isConnected = true;
     if (fromSessionStore) {
       onConnect?.call();
@@ -256,36 +232,37 @@ class WCClient {
 
   Future<void> _encryptAndSend(String result) async {
     final payload = await WCCipher.encrypt(result, _session!.key);
-    // print('encrypted $payload');
+    print('encrypted $payload');
     final message = WCSocketMessage(
       topic: _remotePeerId ?? _session!.topic,
       type: MessageType.PUB,
       payload: jsonEncode(payload.toJson()),
     );
-    // print('message ${jsonEncode(message.toJson())}');
+    print('message ${jsonEncode(message.toJson())}');
     _socketSink!.add(jsonEncode(message.toJson()));
   }
 
   _listen() {
     _socketStream.listen(
       (event) async {
-        // print('DATA: $event ${event.runtimeType}');
+        print('DATA: $event ${event.runtimeType}');
         final Map<String, dynamic> decoded = json.decode("$event");
-        // print('DECODED: $decoded ${decoded.runtimeType}');
+        print('DECODED: $decoded ${decoded.runtimeType}');
         final socketMessage = WCSocketMessage.fromJson(jsonDecode("$event"));
         final decryptedMessage = await _decrypt(socketMessage);
         _handleMessage(decryptedMessage);
       },
       onError: (error) {
-        // print('onError $_isConnected CloseCode ${_webSocket.closeCode} $error');
+        print('onError $_isConnected CloseCode ${_webSocket.closeCode} $error');
         _resetState();
         onFailure?.call('$error');
       },
       onDone: () {
         if (_isConnected) {
-          // print('onDone $_isConnected CloseCode ${_webSocket.closeCode} ${_webSocket.closeReason}');
+          print(
+              'onDone $_isConnected CloseCode ${_webSocket.closeCode} ${_webSocket.closeReason}');
+          onDisconnect?.call(_webSocket.closeCode, _webSocket.closeReason, _session);
           _resetState();
-          onDisconnect?.call(_webSocket.closeCode, _webSocket.closeReason);
         }
       },
     );
@@ -295,7 +272,7 @@ class WCClient {
     final payload =
         WCEncryptionPayload.fromJson(jsonDecode(socketMessage.payload));
     final decrypted = await WCCipher.decrypt(payload, _session!.key);
-    // print("DECRYPTED: $decrypted");
+    print("DECRYPTED: $decrypted");
     return decrypted;
   }
 
@@ -318,7 +295,7 @@ class WCClient {
     switch (request.method) {
       case WCMethod.SESSION_REQUEST:
         final param = WCSessionRequest.fromJson(request.params!.first);
-        // print('SESSION_REQUEST $param');
+        print('SESSION_REQUEST $param');
         _handshakeId = request.id;
         _remotePeerId = param.peerId;
         _remotePeerMeta = param.peerMeta;
@@ -327,13 +304,13 @@ class WCClient {
         break;
       case WCMethod.SESSION_UPDATE:
         final param = WCSessionUpdate.fromJson(request.params!.first);
-        // print('SESSION_UPDATE $param');
+        print('SESSION_UPDATE $param');
         if (!param.approved) {
           killSession();
         }
         break;
       case WCMethod.ETH_SIGN:
-        // print('ETH_SIGN $request');
+        print('ETH_SIGN $request');
         final params = request.params!.cast<String>();
         if (params.length < 2) {
           throw InvalidJsonRpcParamsException(request.id);
@@ -348,7 +325,7 @@ class WCClient {
         );
         break;
       case WCMethod.ETH_PERSONAL_SIGN:
-        // print('ETH_PERSONAL_SIGN $request');
+        print('ETH_PERSONAL_SIGN $request');
         final params = request.params!.cast<String>();
         if (params.length < 2) {
           throw InvalidJsonRpcParamsException(request.id);
@@ -362,8 +339,23 @@ class WCClient {
           ),
         );
         break;
+      case WCMethod.ETH_SIGN_TYPE_DATA_V4:
+        print('ETH_SIGN_TYPE_DATA_V4 $request');
+        final params = request.params!.cast<String>();
+        if (params.length < 2) {
+          throw InvalidJsonRpcParamsException(request.id);
+        }
+
+        onEthSign?.call(
+          request.id,
+          WCEthereumSignMessage(
+            raw: params,
+            type: WCSignType.TYPED_MESSAGE,
+          ),
+        );
+        break;
       case WCMethod.ETH_SIGN_TYPE_DATA:
-        // print('ETH_SIGN_TYPE_DATA $request');
+        print('ETH_SIGN_TYPE_DATA $request');
         final params = request.params!.cast<String>();
         if (params.length < 2) {
           throw InvalidJsonRpcParamsException(request.id);
@@ -378,19 +370,14 @@ class WCClient {
         );
         break;
       case WCMethod.ETH_SIGN_TRANSACTION:
-        // print('ETH_SIGN_TRANSACTION $request');
+        print('ETH_SIGN_TRANSACTION $request');
         final param = WCEthereumTransaction.fromJson(request.params!.first);
         onEthSignTransaction?.call(request.id, param);
         break;
       case WCMethod.ETH_SEND_TRANSACTION:
-        // print('ETH_SEND_TRANSACTION $request');
+        print('ETH_SEND_TRANSACTION $request');
         final param = WCEthereumTransaction.fromJson(request.params!.first);
         onEthSendTransaction?.call(request.id, param);
-        break;
-      case WCMethod.WALLET_SWITCH_NETWORK:
-        // print('WALLET_SWITCH_NETWORK $request');
-        final params = WCWalletSwitchNetwork.fromJson(request.params!.first);
-        onWalletSwitchNetwork?.call(request.id, int.parse(params.chainId));
         break;
       default:
     }
@@ -406,7 +393,6 @@ class WCClient {
     _isConnected = false;
     _session = null;
     _peerId = null;
-    _chainId = null;
     _remotePeerId = null;
     _remotePeerMeta = null;
     _peerMeta = null;

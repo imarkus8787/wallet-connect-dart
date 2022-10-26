@@ -17,7 +17,7 @@ enum WCMethod {
   ETH_SIGN_TYPE_DATA,
 
   @JsonValue("eth_signTypedData_v4")
-  ETH_SIGN_TYPE_DATA_V4
+  ETH_SIGN_TYPE_DATA_V4,
 
   @JsonValue("eth_signTransaction")
   ETH_SIGN_TRANSACTION,
